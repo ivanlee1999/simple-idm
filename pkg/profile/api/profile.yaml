@@ -391,6 +391,9 @@ components:
         display_name:
           type: string
           description: fullname of the user
+        email:
+          type: string
+          
     SuccessResponse:
       x-go-optional-value: true
       type: object
@@ -560,7 +563,11 @@ components:
             $ref: "#/components/schemas/User"
     SelectUsersToAssociateRequiredResponse:
       type: object
+      x-go-optional-value: true
       properties:
+        login_id:
+          type: string
+          format: uuid
         user_options:
           type: array
           items:

@@ -45,7 +45,7 @@ func Check2FAEnabled(
 	twoFactorService twofa.TwoFactorService,
 	tokenService tg.TokenService,
 	tokenCookieService tg.TokenCookieService,
-	userOptions interface{},
+	associateUser bool,
 ) (bool, []TwoFactorMethod, *tg.TokenValue, error) {
 	if twoFactorService == nil {
 		return false, nil, nil, nil
@@ -63,20 +63,6 @@ func Check2FAEnabled(
 	}
 
 	slog.Info("2FA is enabled for login, proceed to 2FA verification", "loginUuid", loginID)
-
-	// Convert mapped users to API users for token claims
-	apiUsers := make([]User, len(idmUsers))
-	for i, mu := range idmUsers {
-		// Extract email and name from claims
-		email, _ := mu.ExtraClaims["email"].(string)
-		name := mu.DisplayName
-
-		apiUsers[i] = User{
-			ID:    mu.UserId,
-			Name:  name,
-			Email: email,
-		}
-	}
 
 	// If email 2FA is enabled, get unique emails from users
 	var twoFactorMethods []TwoFactorMethod
@@ -96,11 +82,11 @@ func Check2FAEnabled(
 
 	extraClaims := map[string]interface{}{
 		"login_id": loginID.String(),
-		"users":    apiUsers,
 	}
 	// Add user options to extra claims if provided
-	if userOptions != nil {
-		extraClaims["user_options"] = userOptions
+	if associateUser {
+		slog.Info("associate users", "login_id", loginID)
+		extraClaims["associate_users"] = true
 	}
 
 	// Updated to use the new TokenService interface

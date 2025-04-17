@@ -61,6 +61,8 @@ type ResponseHandler interface {
 	PrepareUserSwitchResponse(users []mapper.User) *Response
 	// PrepareTokenResponse prepares a response with access and refresh tokens
 	PrepareTokenResponse(tokens map[string]tg.TokenValue) *Response
+	// PrepareUserAssociationSelectionResponse prepares a response for user association selection
+	PrepareUserAssociationSelectionResponse(loginID string, users []mapper.User) *Response
 }
 
 // DefaultResponseHandler is the default implementation of ResponseHandler
@@ -175,6 +177,36 @@ func (h *DefaultResponseHandler) PrepareTokenResponse(tokens map[string]tg.Token
 	}
 }
 
+// PrepareUserAssociationSelectionResponse prepares a response for user association selection
+func (h *DefaultResponseHandler) PrepareUserAssociationSelectionResponse(loginID string, users []mapper.User) *Response {
+	// Convert mapper.User objects to UserOption objects
+	var userOptions []UserOption
+	for _, user := range users {
+		option := UserOption{
+			UserID:      user.UserId,
+			DisplayName: user.DisplayName,
+			Email:       user.UserInfo.Email,
+		}
+
+		userOptions = append(userOptions, option)
+	}
+
+	// Prepare the response with user options for selection
+	resp := SelectUsersToAssociateRequiredResponse{
+		Status:      "user_association_selection_required",
+		Message:     "Please select users to associate",
+		LoginID:     loginID,
+		UserOptions: userOptions,
+	}
+
+	slog.Info("Returning user selection options", "login_id", loginID, "option_count", len(users))
+	return &Response{
+		Code:        http.StatusAccepted,
+		body:        resp,
+		contentType: "application/json",
+	}
+}
+
 // prepare2FARequiredResponse prepares a 2FA required response
 // helper method for login handler, private since no need for separate implementation
 func (h Handle) prepare2FARequiredResponse(commonMethods []common.TwoFactorMethod, tempToken *tg.TokenValue) *Response {
@@ -233,9 +265,9 @@ func (h Handle) checkMultipleUsers(ctx context.Context, w http.ResponseWriter, l
 	return true, &tempToken, nil
 }
 
-// prepareAssociateUsersResponse prepares a response for user association selection
+// prepareUserAssociationSelectionResponse prepares a response for user association selection
 // It generates a temporary token with the necessary claims and returns a properly formatted response
-func (h Handle) prepareAssociateUsersResponse(w http.ResponseWriter, loginID, userID string, userOptions []UserOption) *Response {
+func (h Handle) prepareUserAssociationSelectionResponse(w http.ResponseWriter, loginID, userID string, userOptions []mapper.User) *Response {
 	// Prepare extra claims for the temp token
 	extraClaims := map[string]interface{}{
 		"login_id":     loginID,
@@ -275,27 +307,20 @@ func (h Handle) prepareAssociateUsersResponse(w http.ResponseWriter, loginID, us
 	}
 
 	if len(userOptions) > 1 {
-		// Prepare the response with user options for selection
-		resp := SelectUsersToAssociateRequiredResponse{
-			Status:      "user_association_selection_required",
-			Message:     "Please select users to associate",
-			LoginID:     loginID,
-			UserOptions: userOptions,
-		}
+		return h.responseHandler.PrepareUserAssociationSelectionResponse(loginID, userOptions)
+	}
 
-		slog.Info("Returning user selection options", "user_id", userID, "option_count", len(userOptions))
-		return &Response{
-			Code:        http.StatusAccepted,
-			body:        resp,
-			contentType: "application/json",
-		}
+	user := UserOption{
+		UserID:      userOptions[0].UserId,
+		DisplayName: userOptions[0].DisplayName,
+		Email:       userOptions[0].UserInfo.Email,
 	}
 
 	resp := AssociateUserResponse{
 		Status:     "user_association_required",
 		Message:    "Please call user association endpoint",
 		LoginID:    loginID,
-		UserOption: userOptions[0],
+		UserOption: user,
 	}
 
 	return &Response{
@@ -379,7 +404,7 @@ func (h Handle) PostLogin(w http.ResponseWriter, r *http.Request) *Response {
 		h.twoFactorService,
 		h.tokenService,
 		h.tokenCookieService,
-		nil, // No login options for this flow
+		false, // Not associate user in this API
 	)
 	if err != nil {
 		slog.Error("Failed to check 2FA", "err", err)
@@ -642,7 +667,7 @@ func (h Handle) PostMobileTokenRefresh(w http.ResponseWriter, r *http.Request) *
 	// Generate token claims
 	rootModifications, extraClaims := h.loginService.ToTokenClaims(tokenUser)
 
-	tokens, err := h.tokenService.GenerateTokens(userId, rootModifications, extraClaims)
+	tokens, err := h.tokenService.GenerateMobileTokens(userId, rootModifications, extraClaims)
 	if err != nil {
 		slog.Error("Failed to create tokens", "err", err)
 		return &Response{
@@ -904,7 +929,7 @@ func (h Handle) PostMobileLogin(w http.ResponseWriter, r *http.Request) *Respons
 		h.twoFactorService,
 		h.tokenService,
 		h.tokenCookieService,
-		nil, // No user options for this flow
+		false, // Not associate user in this API
 	)
 	if err != nil {
 		slog.Error("Failed to check 2FA", "err", err)
@@ -936,7 +961,7 @@ func (h Handle) PostMobileLogin(w http.ResponseWriter, r *http.Request) *Respons
 	// Create JWT tokens
 	tokenUser := idmUsers[0]
 	rootModifications, extraClaims := h.loginService.ToTokenClaims(tokenUser)
-	tokens, err := h.tokenService.GenerateTokens(tokenUser.UserId, rootModifications, extraClaims)
+	tokens, err := h.tokenService.GenerateMobileTokens(tokenUser.UserId, rootModifications, extraClaims)
 	if err != nil {
 		slog.Error("Failed to create tokens", "user", tokenUser, "err", err)
 		return &Response{
@@ -1235,12 +1260,20 @@ func (h Handle) Post2faValidate(w http.ResponseWriter, r *http.Request) *Respons
 			body: "2fa validation failed",
 		}
 	}
+	// 2FA validation successful, get users by login ID
+	idmUsers, err := h.userMapper.FindUsersByLoginID(r.Context(), loginId)
+	if err != nil {
+		return &Response{
+			Code: http.StatusInternalServerError,
+			body: "failed to get user roles: " + err.Error(),
+		}
+	}
 
 	// Extract user options from claims using the helper method
-	userOptions := h.ExtractUserOptionsFromClaims(token.Claims)
+	isAssociateUser := h.checkAssociateUser(token.Claims)
 
-	// If we have user options, return a user selection required response
-	if len(userOptions) > 0 {
+	// If we have user options, return a user association selection required response
+	if isAssociateUser {
 		// Extract user ID from token claims
 		userID, err := common.GetUserIDFromClaims(token.Claims)
 		if err != nil {
@@ -1250,17 +1283,7 @@ func (h Handle) Post2faValidate(w http.ResponseWriter, r *http.Request) *Respons
 				body: "Invalid token: " + err.Error(),
 			}
 		}
-		return h.prepareAssociateUsersResponse(w, loginIdStr, userID, userOptions)
-	}
-
-	// 2FA validation successful, create access and refresh tokens
-	// Extract user data from claims to use for token creation
-	idmUsers, err := h.userMapper.FindUsersByLoginID(r.Context(), loginId)
-	if err != nil {
-		return &Response{
-			Code: http.StatusInternalServerError,
-			body: "failed to get user roles: " + err.Error(),
-		}
+		return h.prepareUserAssociationSelectionResponse(w, loginIdStr, userID, idmUsers)
 	}
 
 	if len(idmUsers) == 0 {
@@ -1315,8 +1338,7 @@ func (h Handle) Post2faValidate(w http.ResponseWriter, r *http.Request) *Respons
 	return Post2faValidateJSON200Response(resp)
 }
 
-func (h Handle) ExtractUserOptionsFromClaims(claims jwt.Claims) []UserOption {
-	additionalClaims := make(map[string]interface{})
+func (h Handle) checkAssociateUser(claims jwt.Claims) bool {
 	if mapClaims, ok := claims.(jwt.MapClaims); ok {
 		slog.Info("Claims", "claims", mapClaims)
 
@@ -1325,40 +1347,13 @@ func (h Handle) ExtractUserOptionsFromClaims(claims jwt.Claims) []UserOption {
 			slog.Info("Extra claims", "extraClaims", extraClaims)
 
 			// Extract user options from extra_claims
-			if userOptions, exists := extraClaims["user_options"]; exists {
-				slog.Info("User options found", "userOptions", userOptions)
-				additionalClaims["user_options"] = userOptions
+			if associateUser, exists := extraClaims["associate_users"]; exists {
+				slog.Info("Current 2FA is in associate user flow", "associateUser", associateUser)
+				return associateUser.(bool)
 			}
 		}
 	}
-
-	// Check if we have user options to return
-	if userOptionsData, exists := additionalClaims["user_options"]; exists && userOptionsData != nil {
-		slog.Info("User options found", "userOptions", userOptionsData)
-
-		// Convert to the expected type
-		var userOptions []UserOption
-
-		// Handle different possible formats of user options
-		if optionsSlice, ok := userOptionsData.([]interface{}); ok {
-			for _, opt := range optionsSlice {
-				if optMap, ok := opt.(map[string]interface{}); ok {
-					option := UserOption{}
-					if id, ok := optMap["user_id"].(string); ok {
-						option.UserID = id
-					}
-					if displayName, ok := optMap["display_name"].(string); ok {
-						option.DisplayName = displayName
-					}
-					userOptions = append(userOptions, option)
-				}
-			}
-		}
-
-		return userOptions
-	}
-
-	return nil
+	return false
 }
 
 // GetPasswordResetPolicy returns the current password policy
@@ -1562,7 +1557,7 @@ func (h Handle) PostMobile2faValidate(w http.ResponseWriter, r *http.Request) *R
 	rootModifications, extraClaims := h.loginService.ToTokenClaims(user)
 	extraClaims["2fa_verified"] = true
 
-	tokens, err := h.tokenService.GenerateTokens(user.UserId, rootModifications, extraClaims)
+	tokens, err := h.tokenService.GenerateMobileTokens(user.UserId, rootModifications, extraClaims)
 	if err != nil {
 		slog.Error("Failed to create tokens", "err", err)
 		return &Response{
@@ -1666,7 +1661,7 @@ func (h Handle) PostMobileUserSwitch(w http.ResponseWriter, r *http.Request) *Re
 
 	rootModifications, extraClaims := h.loginService.ToTokenClaims(targetUser)
 
-	tokens, err := h.tokenService.GenerateTokens(targetUser.UserId, rootModifications, extraClaims)
+	tokens, err := h.tokenService.GenerateMobileTokens(targetUser.UserId, rootModifications, extraClaims)
 	if err != nil {
 		slog.Error("Failed to create tokens", "err", err)
 		return &Response{
